@@ -31,3 +31,10 @@ cargo run --release
 ```
 
 
+
+[<img width="1038" height="618" alt="image" src="https://github.com/user-attachments/assets/4e0ad815-03e4-425b-8b91-de0bbdde3693" />](https://docs.freenove.com/projects/fnk0101/en/latest/fnk0101/codes/tutorial/2_ESP32.html)   
+https://docs.freenove.com/projects/fnk0101/en/latest/fnk0101/codes/tutorial/2_ESP32.html   
+
+
+
+
