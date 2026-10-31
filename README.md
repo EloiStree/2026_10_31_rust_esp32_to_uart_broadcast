@@ -15,12 +15,19 @@ cargo install esp-generate --locked
 espup install
 . "$HOME\export-esp.ps1"
 cargo install esp-config --locked
+irm https://github.com/probe-rs/probe-rs/releases/latest/download/probe-rs-tools-installer.ps1 | iex
 
 rustc --version
 cargo --version
 espflash --version
 xtensa-esp32s3-elf-gcc --version
 esp-config --version
+probe-rs --version
+```
+
+To buid and run:
+```
+cargo run --release
 ```
 
 
