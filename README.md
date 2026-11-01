@@ -60,3 +60,6 @@ Level Shifter to explore in the future:
 - TXS0108E	Up to 110 Mbps under specified conditions
 - 74AHCT125	Very fast, simple one-way buffer
 - SN74LVC1T45	Fast, dual-supply translator
+
+
+Maybe use a one to many 5v and 3.3v 74AHCT125 / 74LVC125A to server several device (as I only push data)
