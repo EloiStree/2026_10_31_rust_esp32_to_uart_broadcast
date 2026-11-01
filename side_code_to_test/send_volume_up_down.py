@@ -22,7 +22,7 @@ sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
 values = [1175, 1174,1300,1301,1302,1303,1304,1305,2300,2301,2302,2303,2304,2305]
 
-values = [1175, 1174,1800,1801,1802,1803,1804,1805,2800,2801,2802,2803,2804,2805, 1841, 1849, 1851, 1859, 1861, 1869, 1871, 1879, 1881, 1889, 1891, 1899]
+values = [1175, 1174,1800,1801,1802,1803,1804,1805,2800,2801,2802,2803,2804,2805, 1841, 1849, 1851, 1859, 1861, 1869, 1871, 1879, 1881, 1889, 1891, 1899,"LED_ON" ,"LED_OFF"]
 
 
 def send_value(value):
@@ -35,7 +35,7 @@ if __name__ == "__main__":
         while True:
             for value in values:
                 send_value(value)
-                time.sleep(0.1)
+                time.sleep(1)
     except KeyboardInterrupt:
         print("Stopped by user")
     finally:
