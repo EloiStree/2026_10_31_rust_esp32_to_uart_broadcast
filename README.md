@@ -36,5 +36,22 @@ cargo run --release
 https://docs.freenove.com/projects/fnk0101/en/latest/fnk0101/codes/tutorial/2_ESP32.html   
 
 
+Hardware use in this tool:
+- SSD1306
+- Level Shifter
+- ESP32S3 WROOM 1
+- Arduino Leonardo Keyestudio
+- Freenove Breakout Board
 
 
+Hardware that would be nice for this tool, if it works:
+- [Seeed Studio XIAO ESP32-S3](https://www.seeedstudio.com/XIAO-ESP32S3-p-5627.html) instead of the WROOM
+- [Pro Micro Controller 32U4](https://www.amazon.com.be/-/en/Controller-Update-Interface-Compatible-Arduino/dp/B0D9D5KW2Q/ref=asc_df_B0D9D5KW2Q) instead of Leonardo
+
+
+Level Shifter to explore in the future:
+- PC817	Relatively slow
+- BSS138 module	Not ideal for fast push-pull UART
+- TXS0108E	Up to 110 Mbps under specified conditions
+- 74AHCT125	Very fast, simple one-way buffer
+- SN74LVC1T45	Fast, dual-supply translator
