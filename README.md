@@ -25,31 +25,41 @@ esp-config --version
 probe-rs --version
 ```
 
-To build and run, first set the Wi-Fi environment variables described below:
+To buid and run:
 ```
-cd esp_to_uart
-cargo run --release
-```
-
-## Wi-Fi UDP to UART bridge
-
-The firmware joins a WPA2 Wi-Fi network and listens for UDP datagrams on
-`0.0.0.0:3615`. There is no reply traffic: nothing is sent back over UDP.
-
-- A datagram of exactly **1024 bytes** is drawn on the SSD1306 OLED
-  (128x64, one byte per 8 vertical pixels, page by page from top-left to
-  bottom-right, LSB at the top).
-- Any other datagram has its payload written to UART1 as raw bytes, without
-  framing or line endings.
-
-Set the Wi-Fi credentials in the PowerShell environment before building. They
-are embedded in the firmware at compile time, so do not commit them:
-
-```powershell
-$env:ESP_WIFI_SSID = "your-wifi-name"
-$env:ESP_WIFI_PASSWORD = "your-wifi-password"
-Set-Location .\esp_to_uart
 cargo run --release
 ```
 
 
+
+[<img width="1038" height="618" alt="image" src="https://github.com/user-attachments/assets/4e0ad815-03e4-425b-8b91-de0bbdde3693" />](https://docs.freenove.com/projects/fnk0101/en/latest/fnk0101/codes/tutorial/2_ESP32.html)   
+https://docs.freenove.com/projects/fnk0101/en/latest/fnk0101/codes/tutorial/2_ESP32.html   
+
+
+<img width="1361" height="1019" alt="image" src="https://github.com/user-attachments/assets/05e07e8d-dc66-477b-a48f-76a114620d22" />
+
+
+
+
+Hardware use in this tool:
+- SSD1306
+- Level Shifter
+- ESP32S3 WROOM 1
+- Arduino Leonardo Keyestudio
+- Freenove Breakout Board
+
+
+Hardware that would be nice for this tool, if it works:
+- [Seeed Studio XIAO ESP32-S3](https://www.seeedstudio.com/XIAO-ESP32S3-p-5627.html) instead of the WROOM
+- [Pro Micro Controller 32U4](https://www.amazon.com.be/-/en/Controller-Update-Interface-Compatible-Arduino/dp/B0D9D5KW2Q/ref=asc_df_B0D9D5KW2Q) instead of Leonardo
+
+
+Level Shifter to explore in the future:
+- PC817	Relatively slow
+- BSS138 module	Not ideal for fast push-pull UART
+- TXS0108E	Up to 110 Mbps under specified conditions
+- 74AHCT125	Very fast, simple one-way buffer
+- SN74LVC1T45	Fast, dual-supply translator
+
+
+Maybe use a one to many 5v and 3.3v 74AHCT125 / 74LVC125A to server several device (as I only push data)
