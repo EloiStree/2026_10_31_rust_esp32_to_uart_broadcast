@@ -25,9 +25,47 @@ esp-config --version
 probe-rs --version
 ```
 
-To buid and run:
+To build and run, first set the Wi-Fi environment variables described below:
 ```
+cd esp_to_uart
 cargo run --release
 ```
 
+## Wi-Fi UDP to UART bridge
 
+The firmware joins a WPA2 Wi-Fi network and listens for UDP datagrams on
+`0.0.0.0:3615`. There is no reply traffic: nothing is sent back over UDP.
+
+- A datagram of exactly **1024 bytes** is drawn on the SSD1306 OLED
+  (128x64, one byte per 8 vertical pixels, page by page from top-left to
+  bottom-right, LSB at the top).
+- Any other datagram has its payload written to UART1 as raw bytes, without
+  framing or line endings.
+
+Set the Wi-Fi credentials in the PowerShell environment before building. They
+are embedded in the firmware at compile time, so do not commit them:
+
+```powershell
+$env:ESP_WIFI_SSID = "your-wifi-name"
+$env:ESP_WIFI_PASSWORD = "your-wifi-password"
+Set-Location .\esp_to_uart
+cargo run --release
+```
+
+The device prints its DHCP address in the serial log. Send UDP datagrams to
+that address on port `3615`, for example:
+
+```powershell
+$c = New-Object System.Net.Sockets.UdpClient
+$b = [Text.Encoding]::ASCII.GetBytes("hello`n")
+$c.Send($b, $b.Length, "DEVICE_IP", 3615)
+```
+
+UART1 uses `115200` baud, 8 data bits, no parity, and 1 stop bit. The defaults
+are GPIO17 for ESP32-S3 TX and GPIO18 for RX. Connect ESP TX to the other
+device's RX, ESP RX to the other device's TX, and connect ground between both
+devices. ESP32-S3 GPIO uses 3.3 V logic; use a level shifter for any 5 V UART
+signals and verify the pinout of your specific board before wiring.
+
+The UDP bridge has no authentication or encryption, by design for classroom
+use. Only use it on a trusted network.

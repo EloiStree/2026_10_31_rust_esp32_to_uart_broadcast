@@ -7,80 +7,241 @@
 )]
 #![deny(clippy::large_stack_frames)]
 
-use bt_hci::controller::ExternalController;
 use embassy_executor::Spawner;
+use embassy_net::{
+    IpListenEndpoint, Runner, Stack, StackResources,
+    udp::{PacketMetadata, UdpSocket},
+};
 use embassy_time::{Duration, Timer};
+use embedded_graphics::prelude::Point;
 use esp_backtrace as _;
-use esp_hal::clock::CpuClock;
-use esp_hal::timer::timg::TimerGroup;
-use esp_radio::ble::controller::BleConnector;
-use log::info;
-use trouble_host::prelude::*;
+use esp_hal::{
+    clock::CpuClock,
+    gpio::{Level, Output, OutputConfig},
+    rng::Rng,
+    timer::timg::TimerGroup,
+    uart::{Config as UartConfig, Uart},
+};
+use esp_radio::wifi::{
+    AuthenticationMethodConfig, Config as WifiConfig, Interface, WifiController, sta::StationConfig,
+};
+use log::{info, warn};
+use static_cell::StaticCell;
+
+use crate::ssd1306::StructSetSSD1306;
 
 extern crate alloc;
 
-const CONNECTIONS_MAX: usize = 1;
-const L2CAP_CHANNELS_MAX: usize = 1;
+#[path = "ssd1306.rs"]
+mod ssd1306;
 
-// This creates a default app-descriptor required by the esp-idf bootloader.
-// For more information see: <https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/app_image_format.html#application-description>
+const UART_BAUDRATE: u32 = 9600; // Change to 9600 if using bluetooth
+const UART_PARITY: esp_hal::uart::Parity = esp_hal::uart::Parity::None;
+const UART_STOP_BITS: esp_hal::uart::StopBits = esp_hal::uart::StopBits::_1;
+const UART_DATA_BITS: esp_hal::uart::DataBits = esp_hal::uart::DataBits::_8;
+
+const UART_TX_PIN: u8 = 17;
+const UART_RX_PIN: u8 = 18;
+const UDP_PORT: u16 = 3615;
+const UDP_BUFFER_SIZE: usize = 4096;
+const UDP_PACKET_SLOTS: usize = 8;
+const DISPLAY_FRAME_SIZE: usize = 1024;
+const TRANSFER_BUFFER_SIZE: usize = 1024;
+
+static NETWORK_RESOURCES: StaticCell<StackResources<3>> = StaticCell::new();
+static UDP_RX_BUFFER: StaticCell<[u8; UDP_BUFFER_SIZE]> = StaticCell::new();
+static UDP_TX_BUFFER: StaticCell<[u8; UDP_BUFFER_SIZE]> = StaticCell::new();
+static UDP_TO_UART: StaticCell<[u8; TRANSFER_BUFFER_SIZE]> = StaticCell::new();
+static UDP_RX_META: StaticCell<[PacketMetadata; UDP_PACKET_SLOTS]> = StaticCell::new();
+static UDP_TX_META: StaticCell<[PacketMetadata; UDP_PACKET_SLOTS]> = StaticCell::new();
+
 esp_bootloader_esp_idf::esp_app_desc!();
+
+#[embassy_executor::task]
+async fn network_task(mut runner: Runner<'static, Interface>) -> ! {
+    runner.run().await
+}
+
+#[embassy_executor::task]
+#[allow(
+    clippy::large_stack_frames,
+    reason = "Embassy stores task futures in its executor task arena"
+)]
+async fn bridge_task(
+    stack: Stack<'static>,
+    mut uart: Uart<'static, esp_hal::Async>,
+    mut display: StructSetSSD1306,
+) -> ! {
+    let rx_buffer = UDP_RX_BUFFER.init([0; UDP_BUFFER_SIZE]);
+    let tx_buffer = UDP_TX_BUFFER.init([0; UDP_BUFFER_SIZE]);
+    let rx_meta = UDP_RX_META.init([PacketMetadata::EMPTY; UDP_PACKET_SLOTS]);
+    let tx_meta = UDP_TX_META.init([PacketMetadata::EMPTY; UDP_PACKET_SLOTS]);
+
+    let mut socket = UdpSocket::new(
+        stack,
+        &mut rx_meta[..],
+        &mut rx_buffer[..],
+        &mut tx_meta[..],
+        &mut tx_buffer[..],
+    );
+    // Port only, no address: accepts datagrams sent to any local address.
+    socket
+        .bind(IpListenEndpoint {
+            addr: None,
+            port: UDP_PORT,
+        })
+        .expect("Failed to bind the UDP socket");
+    info!("Listening for UDP datagrams on 0.0.0.0:{}", UDP_PORT);
+
+    let udp_to_uart = UDP_TO_UART.init([0; TRANSFER_BUFFER_SIZE]);
+
+    loop {
+        match socket.recv_from(&mut udp_to_uart[..]).await {
+            Ok((DISPLAY_FRAME_SIZE, _)) => {
+                let frame: &[u8; DISPLAY_FRAME_SIZE] = udp_to_uart[..DISPLAY_FRAME_SIZE]
+                    .try_into()
+                    .expect("slice length equals DISPLAY_FRAME_SIZE");
+                if let Err(error) = display.set_from_1024_bytes_array_top_left_to_down_right(frame)
+                {
+                    warn!("Display update failed: {:?}", error);
+                }
+            }
+            Ok((length, _)) => {
+                let mut offset = 0;
+                while offset < length {
+                    //info!("Writing {} bytes to UART: {:?}", length - offset, &udp_to_uart[offset..length]);
+
+                    match uart.write_async(&udp_to_uart[offset..length]).await {
+                        Ok(written) => offset += written,
+                        Err(error) => {
+                            warn!("UART write failed: {:?}", error);
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                warn!("UDP receive failed: {:?}", error);
+            }
+        }
+    }
+}
 
 #[allow(
     clippy::large_stack_frames,
-    reason = "it's not unusual to allocate larger buffers etc. in main"
+    reason = "the ESP32 entry point owns peripherals and initializes larger buffers"
 )]
 #[esp_rtos::main]
 async fn main(spawner: Spawner) -> ! {
-    // generator version: 2.0.0
-    // generator parameters: -o esp32s3 -o esp32s3-wroom-1 -o vscode -o unstable-hal -o alloc -o embassy -o wifi -o ble-trouble -o log -o esp-backtrace
-
     esp_println::logger::init_logger_from_env();
+
+    let wifi_ssid = "SSD1306";
+    let wifi_password = "12345678";
 
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
 
-    // The following pins are used to bootstrap the chip. They are available
-    // for use, but check the datasheet of the module for more information on them.
-    // - GPIO0
-    // - GPIO3
-    // - GPIO45
-    // - GPIO46
-    // These GPIO pins are in use by some feature of the module and should not be used.
     let _gpio27 = peripherals.GPIO27;
     let _gpio28 = peripherals.GPIO28;
     let _gpio29 = peripherals.GPIO29;
     let _gpio30 = peripherals.GPIO30;
     let _gpio31 = peripherals.GPIO31;
     let _gpio32 = peripherals.GPIO32;
+    let mut led = Output::new(peripherals.GPIO48, Level::Low, OutputConfig::default());
 
     esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 73744);
-    // COEX needs more RAM - so we've added some more
     esp_alloc::heap_allocator!(size: 64 * 1024);
 
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     esp_rtos::start(timg0.timer0, peripherals.FROM_CPU_INTR0);
+    info!("Embassy initialized");
 
-    info!("Embassy initialized!");
+    let i2c =
+        esp_hal::i2c::master::I2c::new(peripherals.I2C0, esp_hal::i2c::master::Config::default())
+            .unwrap()
+            .with_sda(peripherals.GPIO8)
+            .with_scl(peripherals.GPIO9);
+    let mut display = StructSetSSD1306::new(i2c).unwrap();
+    display.set_black().unwrap();
+    display
+        .set_text("Wi-Fi UART\nConnecting...", Point::new(0, 0))
+        .unwrap();
+    info!(
+        "OLED I2C uses SDA GPIO{} and SCL GPIO{}",
+        ssd1306::SSD1306_SDA_PIN,
+        ssd1306::SSD1306_SCL_PIN
+    );
 
-    let _wifi_controller =
-        esp_radio::wifi::WifiController::new(peripherals.WIFI, Default::default())
-            .expect("Failed to initialize Wi-Fi controller");
-    let _wifi_interface = esp_radio::wifi::Interface::station();
-    // find more examples https://github.com/embassy-rs/trouble/tree/main/examples/esp32
-    let transport = BleConnector::new(peripherals.BT, Default::default()).unwrap();
-    let ble_controller = ExternalController::<_, 1>::new(transport);
-    let mut resources: HostResources<_, DefaultPacketPool, CONNECTIONS_MAX, L2CAP_CHANNELS_MAX> =
-        HostResources::new();
-    let _stack = trouble_host::new(ble_controller, &mut resources).build();
+    let mut wifi_controller =
+        WifiController::new(peripherals.WIFI, Default::default()).expect("Wi-Fi init failed");
+    let wifi_interface = Interface::station();
+    let station_config = StationConfig::default()
+        .with_ssid(
+            wifi_ssid
+                .try_into()
+                .expect("ESP_WIFI_SSID is longer than the supported Wi-Fi SSID length"),
+        )
+        .with_authentication(AuthenticationMethodConfig::Wpa2Personal(
+            wifi_password
+                .try_into()
+                .expect("ESP_WIFI_PASSWORD is longer than the supported password length"),
+        ));
+    wifi_controller
+        .set_config(&WifiConfig::Station(station_config))
+        .expect("Wi-Fi configuration failed");
 
-    // TODO: Spawn some tasks
-    let _ = spawner;
+    let network_resources = NETWORK_RESOURCES.init(StackResources::new());
+    let (stack, runner) = embassy_net::new(
+        wifi_interface,
+        embassy_net::Config::dhcpv4(Default::default()),
+        network_resources,
+        Rng::new().random() as u64,
+    );
+    spawner.spawn(network_task(runner).expect("Network task storage is exhausted"));
+
+    wifi_controller
+        .connect_async()
+        .await
+        .expect("Failed to connect to the Wi-Fi network");
+    info!("Connected to Wi-Fi; waiting for a DHCP address");
+    stack.wait_config_up().await;
+    info!("Network ready: {:?}", stack.config_v4());
+    display.set_black().unwrap();
+
+    let uart = Uart::new(
+        peripherals.UART1,
+        UartConfig::default()
+            .with_baudrate(UART_BAUDRATE)
+            .with_parity(UART_PARITY)
+            .with_stop_bits(UART_STOP_BITS)
+            .with_data_bits(UART_DATA_BITS),
+    )
+    .expect("UART configuration failed")
+    .with_tx(peripherals.GPIO17)
+    .with_rx(peripherals.GPIO18)
+    .into_async();
+    info!(
+        "UART1 bridge uses TX GPIO{}, RX GPIO{} at {} baud",
+        UART_TX_PIN, UART_RX_PIN, UART_BAUDRATE
+    );
+    let ipv4 = stack.config_v4().unwrap().address;
+    
+    display
+        .set_text(
+            &alloc::format!(
+                "Wi-Fi connected\nUDP port: {}\nUART1: {} baud\nIP: {}",
+                UDP_PORT,
+                UART_BAUDRATE,
+                ipv4
+            ),
+            Point::new(0, 0),
+        )
+        .unwrap();
+
+    spawner.spawn(bridge_task(stack, uart, display).expect("Bridge task storage is exhausted"));
 
     loop {
-        info!("Hello world!");
-        Timer::after(Duration::from_secs(1)).await;
+        Timer::after(Duration::from_millis(500)).await;
+        led.toggle();
     }
-
-    // for inspiration have a look at the examples at https://github.com/esp-rs/esp-hal/tree/esp-hal-v1.2.2/examples
 }
