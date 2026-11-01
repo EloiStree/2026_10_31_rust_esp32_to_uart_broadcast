@@ -52,20 +52,4 @@ Set-Location .\esp_to_uart
 cargo run --release
 ```
 
-The device prints its DHCP address in the serial log. Send UDP datagrams to
-that address on port `3615`, for example:
 
-```powershell
-$c = New-Object System.Net.Sockets.UdpClient
-$b = [Text.Encoding]::ASCII.GetBytes("hello`n")
-$c.Send($b, $b.Length, "DEVICE_IP", 3615)
-```
-
-UART1 uses `115200` baud, 8 data bits, no parity, and 1 stop bit. The defaults
-are GPIO17 for ESP32-S3 TX and GPIO18 for RX. Connect ESP TX to the other
-device's RX, ESP RX to the other device's TX, and connect ground between both
-devices. ESP32-S3 GPIO uses 3.3 V logic; use a level shifter for any 5 V UART
-signals and verify the pinout of your specific board before wiring.
-
-The UDP bridge has no authentication or encryption, by design for classroom
-use. Only use it on a trusted network.
