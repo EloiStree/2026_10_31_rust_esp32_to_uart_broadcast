@@ -36,6 +36,11 @@ cargo run --release
 https://docs.freenove.com/projects/fnk0101/en/latest/fnk0101/codes/tutorial/2_ESP32.html   
 
 
+<img width="1361" height="1019" alt="image" src="https://github.com/user-attachments/assets/05e07e8d-dc66-477b-a48f-76a114620d22" />
+
+
+
+
 Hardware use in this tool:
 - SSD1306
 - Level Shifter
