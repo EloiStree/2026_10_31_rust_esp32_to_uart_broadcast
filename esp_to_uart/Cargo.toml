@@ -35,6 +35,7 @@ embassy-net = { version = "0.9.1", features = [
   "dhcpv4",
   "log",
   "medium-ethernet",
+  "multicast",
   "tcp",
   "udp",
 ] }

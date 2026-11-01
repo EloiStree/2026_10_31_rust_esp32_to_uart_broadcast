@@ -9,7 +9,7 @@
 
 use embassy_executor::Spawner;
 use embassy_net::{
-    IpListenEndpoint, Runner, Stack, StackResources,
+    IpEndpoint, IpListenEndpoint, Ipv4Address, Runner, Stack, StackResources,
     udp::{PacketMetadata, UdpSocket},
 };
 use embassy_time::{Duration, Timer};
@@ -40,15 +40,25 @@ const UART_PARITY: esp_hal::uart::Parity = esp_hal::uart::Parity::None;
 const UART_STOP_BITS: esp_hal::uart::StopBits = esp_hal::uart::StopBits::_1;
 const UART_DATA_BITS: esp_hal::uart::DataBits = esp_hal::uart::DataBits::_8;
 
-const UART_TX_PIN: u8 = 17;
-const UART_RX_PIN: u8 = 18;
+const UART_TX_PINS: [u8; 5] = [4, 5, 7, 8, 17];
 const UDP_PORT: u16 = 3615;
 const UDP_BUFFER_SIZE: usize = 4096;
 const UDP_PACKET_SLOTS: usize = 8;
 const DISPLAY_FRAME_SIZE: usize = 1024;
 const TRANSFER_BUFFER_SIZE: usize = 1024;
 
-static NETWORK_RESOURCES: StaticCell<StackResources<3>> = StaticCell::new();
+const MDNS_PORT: u16 = 5353;
+const MDNS_GROUP: Ipv4Address = Ipv4Address::new(224, 0, 0, 251);
+const MDNS_NAME: [&[u8]; 2] = [b"uart", b"local"];
+const MDNS_BUFFER_SIZE: usize = 512;
+
+static NETWORK_RESOURCES: StaticCell<StackResources<4>> = StaticCell::new();
+static MDNS_RX_BUFFER: StaticCell<[u8; MDNS_BUFFER_SIZE]> = StaticCell::new();
+static MDNS_TX_BUFFER: StaticCell<[u8; MDNS_BUFFER_SIZE]> = StaticCell::new();
+static MDNS_RX_META: StaticCell<[PacketMetadata; 4]> = StaticCell::new();
+static MDNS_TX_META: StaticCell<[PacketMetadata; 4]> = StaticCell::new();
+static MDNS_QUERY: StaticCell<[u8; MDNS_BUFFER_SIZE]> = StaticCell::new();
+static MDNS_PACKET: StaticCell<[u8; MDNS_BUFFER_SIZE]> = StaticCell::new();
 static UDP_RX_BUFFER: StaticCell<[u8; UDP_BUFFER_SIZE]> = StaticCell::new();
 static UDP_TX_BUFFER: StaticCell<[u8; UDP_BUFFER_SIZE]> = StaticCell::new();
 static UDP_TO_UART: StaticCell<[u8; TRANSFER_BUFFER_SIZE]> = StaticCell::new();
@@ -57,9 +67,143 @@ static UDP_TX_META: StaticCell<[PacketMetadata; UDP_PACKET_SLOTS]> = StaticCell:
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
+/// Returns true if the query asks for an A record of `uart.local`.
+fn mdns_query_matches(packet: &[u8]) -> bool {
+    if packet.len() < 12 || packet[2] & 0x80 != 0 {
+        return false;
+    }
+    let question_count = u16::from_be_bytes([packet[4], packet[5]]);
+    let mut pos = 12;
+    for _ in 0..question_count {
+        let mut label_index = 0;
+        let mut name_matches = true;
+        loop {
+            let Some(&len) = packet.get(pos) else {
+                return false;
+            };
+            pos += 1;
+            if len == 0 {
+                break;
+            }
+            if len & 0xC0 != 0 {
+                return false;
+            }
+            let Some(label) = packet.get(pos..pos + len as usize) else {
+                return false;
+            };
+            pos += len as usize;
+            match MDNS_NAME.get(label_index) {
+                Some(expected) if label.eq_ignore_ascii_case(expected) => {}
+                _ => name_matches = false,
+            }
+            label_index += 1;
+        }
+        if label_index != MDNS_NAME.len() {
+            name_matches = false;
+        }
+        let Some(tail) = packet.get(pos..pos + 4) else {
+            return false;
+        };
+        pos += 4;
+        let qtype = u16::from_be_bytes([tail[0], tail[1]]);
+        let qclass = u16::from_be_bytes([tail[2], tail[3]]) & 0x7FFF;
+        if name_matches && (qtype == 1 || qtype == 255) && (qclass == 1 || qclass == 255) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Builds an mDNS answer for `uart.local` and returns its length.
+fn mdns_build_answer(out: &mut [u8], id: u16, ip: Ipv4Address) -> usize {
+    out[0..2].copy_from_slice(&id.to_be_bytes());
+    out[2..4].copy_from_slice(&0x8400u16.to_be_bytes());
+    out[4..6].copy_from_slice(&0u16.to_be_bytes());
+    out[6..8].copy_from_slice(&1u16.to_be_bytes());
+    out[8..12].copy_from_slice(&[0; 4]);
+    let mut pos = 12;
+    for label in MDNS_NAME {
+        out[pos] = label.len() as u8;
+        out[pos + 1..pos + 1 + label.len()].copy_from_slice(label);
+        pos += 1 + label.len();
+    }
+    out[pos] = 0;
+    pos += 1;
+    out[pos..pos + 2].copy_from_slice(&1u16.to_be_bytes());
+    out[pos + 2..pos + 4].copy_from_slice(&0x8001u16.to_be_bytes());
+    out[pos + 4..pos + 8].copy_from_slice(&120u32.to_be_bytes());
+    out[pos + 8..pos + 10].copy_from_slice(&4u16.to_be_bytes());
+    out[pos + 10..pos + 14].copy_from_slice(&ip.octets());
+    pos + 14
+}
+
+#[embassy_executor::task]
+#[allow(
+    clippy::large_stack_frames,
+    reason = "Embassy stores task futures in its executor task arena"
+)]
+async fn mdns_task(stack: Stack<'static>) -> ! {
+    let rx_buffer = MDNS_RX_BUFFER.init([0; MDNS_BUFFER_SIZE]);
+    let tx_buffer = MDNS_TX_BUFFER.init([0; MDNS_BUFFER_SIZE]);
+    let rx_meta = MDNS_RX_META.init([PacketMetadata::EMPTY; 4]);
+    let tx_meta = MDNS_TX_META.init([PacketMetadata::EMPTY; 4]);
+    let query = MDNS_QUERY.init([0; MDNS_BUFFER_SIZE]);
+    let packet = MDNS_PACKET.init([0; MDNS_BUFFER_SIZE]);
+
+    let mut socket = UdpSocket::new(
+        stack,
+        &mut rx_meta[..],
+        &mut rx_buffer[..],
+        &mut tx_meta[..],
+        &mut tx_buffer[..],
+    );
+    socket
+        .bind(MDNS_PORT)
+        .expect("Failed to bind the mDNS socket");
+    if let Err(error) = stack.join_multicast_group(MDNS_GROUP) {
+        warn!("mDNS multicast join failed: {:?}", error);
+    }
+    info!("mDNS answering for uart.local");
+
+    loop {
+        let Ok((length, sender)) = socket.recv_from(&mut query[..]).await else {
+            continue;
+        };
+        if !mdns_query_matches(&query[..length]) {
+            continue;
+        }
+        let Some(config) = stack.config_v4() else {
+            continue;
+        };
+        // Legacy unicast queries (source port != 5353) get a unicast reply.
+        let (id, destination) = if sender.endpoint.port == MDNS_PORT {
+            (0, IpEndpoint::new(MDNS_GROUP.into(), MDNS_PORT))
+        } else {
+            (u16::from_be_bytes([query[0], query[1]]), sender.endpoint)
+        };
+        let answer_length = mdns_build_answer(packet, id, config.address.address());
+        if let Err(error) = socket.send_to(&packet[..answer_length], destination).await {
+            warn!("mDNS send failed: {:?}", error);
+        }
+    }
+}
+
 #[embassy_executor::task]
 async fn network_task(mut runner: Runner<'static, Interface>) -> ! {
     runner.run().await
+}
+
+async fn write_all(uart: &mut Uart<'static, esp_hal::Async>, data: &[u8]) {
+    let mut offset = 0;
+    while offset < data.len() {
+        match uart.write_async(&data[offset..]).await {
+            Ok(written) => offset += written,
+            Err(error) => {
+                warn!("UART write failed: {:?}", error);
+                break;
+            }
+        }
+    }
 }
 
 #[embassy_executor::task]
@@ -69,7 +213,7 @@ async fn network_task(mut runner: Runner<'static, Interface>) -> ! {
 )]
 async fn bridge_task(
     stack: Stack<'static>,
-    mut uart: Uart<'static, esp_hal::Async>,
+    mut uarts: [Uart<'static, esp_hal::Async>; 2],
     mut display: StructSetSSD1306,
 ) -> ! {
     let rx_buffer = UDP_RX_BUFFER.init([0; UDP_BUFFER_SIZE]);
@@ -107,17 +251,8 @@ async fn bridge_task(
                 }
             }
             Ok((length, _)) => {
-                let mut offset = 0;
-                while offset < length {
-                    //info!("Writing {} bytes to UART: {:?}", length - offset, &udp_to_uart[offset..length]);
-
-                    match uart.write_async(&udp_to_uart[offset..length]).await {
-                        Ok(written) => offset += written,
-                        Err(error) => {
-                            warn!("UART write failed: {:?}", error);
-                            break;
-                        }
-                    }
+                for uart in uarts.iter_mut() {
+                    write_all(uart, &udp_to_uart[..length]).await;
                 }
             }
             Err(error) => {
@@ -135,8 +270,9 @@ async fn bridge_task(
 async fn main(spawner: Spawner) -> ! {
     esp_println::logger::init_logger_from_env();
 
-    let wifi_ssid = "SSD1306";
-    let wifi_password = "12345678";
+    
+    let wifi_ssid_default = "UART.LOCAL";
+    let wifi_password_default = "12345678";
 
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
@@ -177,12 +313,12 @@ async fn main(spawner: Spawner) -> ! {
     let wifi_interface = Interface::station();
     let station_config = StationConfig::default()
         .with_ssid(
-            wifi_ssid
+            wifi_ssid_default
                 .try_into()
                 .expect("ESP_WIFI_SSID is longer than the supported Wi-Fi SSID length"),
         )
         .with_authentication(AuthenticationMethodConfig::Wpa2Personal(
-            wifi_password
+            wifi_password_default
                 .try_into()
                 .expect("ESP_WIFI_PASSWORD is longer than the supported password length"),
         ));
@@ -208,28 +344,31 @@ async fn main(spawner: Spawner) -> ! {
     info!("Network ready: {:?}", stack.config_v4());
     display.set_black().unwrap();
 
-    let uart = Uart::new(
-        peripherals.UART1,
-        UartConfig::default()
-            .with_baudrate(UART_BAUDRATE)
-            .with_parity(UART_PARITY)
-            .with_stop_bits(UART_STOP_BITS)
-            .with_data_bits(UART_DATA_BITS),
-    )
-    .expect("UART configuration failed")
-    .with_tx(peripherals.GPIO17)
-    .with_rx(peripherals.GPIO18)
-    .into_async();
+    let uart_config = UartConfig::default()
+        .with_baudrate(UART_BAUDRATE)
+        .with_parity(UART_PARITY)
+        .with_stop_bits(UART_STOP_BITS)
+        .with_data_bits(UART_DATA_BITS);
+    // Transmit only: RX pins (6, 18) are left unused.
+    let uart1 = Uart::new(peripherals.UART1, uart_config)
+        .expect("UART1 configuration failed")
+        .with_tx(peripherals.GPIO7)
+        .into_async();
+    let uart2 = Uart::new(peripherals.UART2, uart_config)
+        .expect("UART2 configuration failed")
+        .with_tx(peripherals.GPIO17)
+        .into_async();
     info!(
-        "UART1 bridge uses TX GPIO{}, RX GPIO{} at {} baud",
-        UART_TX_PIN, UART_RX_PIN, UART_BAUDRATE
+        "UART TX outputs: GPIO{}, GPIO{} at {} baud",
+        UART_TX_PINS[0], UART_TX_PINS[1], UART_BAUDRATE
     );
+    let uarts = [uart1, uart2];
     let ipv4 = stack.config_v4().unwrap().address;
-    
+
     display
         .set_text(
             &alloc::format!(
-                "Wi-Fi connected\nUDP port: {}\nUART1: {} baud\nIP: {}",
+                "Wi-Fi connected\nUDP port: {}\nUART TX 7,17: {} baud\nIP: {}",
                 UDP_PORT,
                 UART_BAUDRATE,
                 ipv4
@@ -238,7 +377,8 @@ async fn main(spawner: Spawner) -> ! {
         )
         .unwrap();
 
-    spawner.spawn(bridge_task(stack, uart, display).expect("Bridge task storage is exhausted"));
+    spawner.spawn(bridge_task(stack, uarts, display).expect("Bridge task storage is exhausted"));
+    spawner.spawn(mdns_task(stack).expect("mDNS task storage is exhausted"));
 
     loop {
         Timer::after(Duration::from_millis(500)).await;
