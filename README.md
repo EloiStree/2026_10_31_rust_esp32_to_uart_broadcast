@@ -1,5 +1,9 @@
 # 2026_10_31_rust_esp32_to_uart
+
+
 I need to add WiFi to Micro:Bit and Arduino with level shifter, so I want to check if I can Rust my way to that with Esp32
+
+<img width="1371" height="940" alt="image" src="https://github.com/user-attachments/assets/eb7fa4f3-8fea-4271-ae8f-4e312d5f2a5d" />
 
 
 Install on window
