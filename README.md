@@ -98,5 +98,5 @@ https://github.com/bsiever/microbit-pxt-blehid
 Example:    
 - https://github.com/eloistree/2026_02_11_makecode_hello_uart_in        
 - https://github.com/EloiStree/2026_09_12_makecode_hello_uart_bluetooth_ks_4036
+- https://github.com/EloiStree/2026_09_12_makecode_hello_uart_bluetooth_ks_4036/tree/pins_ble_input_version
 
-- 
