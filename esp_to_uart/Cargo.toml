@@ -4,6 +4,7 @@ edition      = "2024"
 name         = "esp_to_uart"
 rust-version = "1.95"
 version      = "0.1.0"
+autobins     = false
 
 [[bin]]
 name = "esp_to_uart"

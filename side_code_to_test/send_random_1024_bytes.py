@@ -17,7 +17,7 @@ payload = secrets.token_bytes(1024)
 print(f"Sending payload to {UDP_IP}:{PORT}")
 
 while True:
-    sleep(0.25)
+    sleep(0.4)
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as connection:
         #Randomise the payload for each send
         payload = secrets.token_bytes(1024)

@@ -8,14 +8,15 @@ use embedded_graphics::{
     text::{Baseline, Text},
 };
 
-pub const SSD1306_SDA_PIN: u8 = 8;
-pub const SSD1306_SCL_PIN: u8 = 9;
-pub const SSD1306_I2C_ADDRESS: u8 = 0x3C;
+pub const SSD1306_SDA_PIN: u8 = 7;
+pub const SSD1306_SCL_PIN: u8 = 8;
+pub const SSD1306_I2C_ADDRESSES: [u8; 2] = [0x3C, 0x3D];
 
 /// Helper for drawing simple patterns on a monochrome SSD1306 display.
 pub struct StructSetSSD1306 {
     pixels: alloc::boxed::Box<[u8]>,
     i2c: esp_hal::i2c::master::I2c<'static, esp_hal::Blocking>,
+    address: u8,
 }
 
 #[allow(
@@ -27,17 +28,30 @@ impl StructSetSSD1306 {
     pub fn new(
         i2c: esp_hal::i2c::master::I2c<'static, esp_hal::Blocking>,
     ) -> Result<Self, esp_hal::i2c::master::Error> {
+        let mut i2c = i2c;
+        // Probe the two addresses an SSD1306 module can be strapped to.
+        let mut address = SSD1306_I2C_ADDRESSES[0];
+        let mut probe = Ok(());
+        for candidate in SSD1306_I2C_ADDRESSES {
+            probe = i2c.write(candidate, &[0x00, 0xAE]);
+            if probe.is_ok() {
+                address = candidate;
+                break;
+            }
+        }
+        probe?;
         let mut s = Self {
             pixels: alloc::vec![0; 1024].into_boxed_slice(),
             i2c,
+            address,
         };
         // Standard SSD1306 128x64 init sequence (control byte 0x00 = commands).
         let init: [u8; 25] = [
             0x00, 0xAE, 0xD5, 0x80, 0xA8, 0x3F, 0xD3, 0x00, 0x40, 0x8D, 0x14, 0x20, 0x00, 0xA1,
             0xC8, 0xDA, 0x12, 0x81, 0xCF, 0xD9, 0xF1, 0xDB, 0x40, 0xA4, 0xA6,
         ];
-        s.i2c.write(SSD1306_I2C_ADDRESS, &init)?;
-        s.i2c.write(SSD1306_I2C_ADDRESS, &[0x00, 0xAF])?;
+        s.i2c.write(s.address, &init)?;
+        s.i2c.write(s.address, &[0x00, 0xAF])?;
         Ok(s)
     }
 
@@ -59,13 +73,13 @@ impl StructSetSSD1306 {
         for page in 0..8usize {
             // Set page and column start.
             self.i2c
-                .write(SSD1306_I2C_ADDRESS, &[0x00, 0xB0 | page as u8, 0x00, 0x10])?;
+                .write(self.address, &[0x00, 0xB0 | page as u8, 0x00, 0x10])?;
             let mut buf = [0u8; 129];
             buf[0] = 0x40; // control byte: data
             for x in 0..128usize {
                 buf[x + 1] = self.pixels[page * 128 + x];
             }
-            self.i2c.write(SSD1306_I2C_ADDRESS, &buf)?;
+            self.i2c.write(self.address, &buf)?;
         }
         Ok(())
     }

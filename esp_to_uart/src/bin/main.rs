@@ -8,8 +8,9 @@
 #![deny(clippy::large_stack_frames)]
 
 use embassy_executor::Spawner;
+use embassy_futures::select::{Either, select};
 use embassy_net::{
-    IpEndpoint, IpListenEndpoint, Ipv4Address, Runner, Stack, StackResources,
+    IpAddress, IpEndpoint, IpListenEndpoint, Ipv4Address, Runner, Stack, StackResources,
     udp::{PacketMetadata, UdpSocket},
 };
 use embassy_time::{Duration, Timer};
@@ -40,8 +41,11 @@ const UART_PARITY: esp_hal::uart::Parity = esp_hal::uart::Parity::None;
 const UART_STOP_BITS: esp_hal::uart::StopBits = esp_hal::uart::StopBits::_1;
 const UART_DATA_BITS: esp_hal::uart::DataBits = esp_hal::uart::DataBits::_8;
 
-const UART_TX_PINS: [u8; 3] = [17, 7, 4];
+const UART_TX_PIN: u8 = 5;
+const UART_RX_PIN: u8 = 6;
 const UDP_PORT: u16 = 3615;
+const UART_TO_UDP_PORT: u16 = 2501;
+const UDP_CLIENT_LIMIT: usize = 8;
 const UDP_BUFFER_SIZE: usize = 4096;
 const UDP_PACKET_SLOTS: usize = 8;
 const DISPLAY_FRAME_SIZE: usize = 1024;
@@ -62,6 +66,7 @@ static MDNS_PACKET: StaticCell<[u8; MDNS_BUFFER_SIZE]> = StaticCell::new();
 static UDP_RX_BUFFER: StaticCell<[u8; UDP_BUFFER_SIZE]> = StaticCell::new();
 static UDP_TX_BUFFER: StaticCell<[u8; UDP_BUFFER_SIZE]> = StaticCell::new();
 static UDP_TO_UART: StaticCell<[u8; TRANSFER_BUFFER_SIZE]> = StaticCell::new();
+static UART_TO_UDP: StaticCell<[u8; TRANSFER_BUFFER_SIZE]> = StaticCell::new();
 static UDP_RX_META: StaticCell<[PacketMetadata; UDP_PACKET_SLOTS]> = StaticCell::new();
 static UDP_TX_META: StaticCell<[PacketMetadata; UDP_PACKET_SLOTS]> = StaticCell::new();
 
@@ -206,6 +211,18 @@ async fn write_all(uart: &mut Uart<'static, esp_hal::Async>, data: &[u8]) {
     }
 }
 
+fn remember_udp_client(clients: &mut [Option<IpAddress>], address: IpAddress) -> bool {
+    if clients.contains(&Some(address)) {
+        return true;
+    }
+
+    let Some(slot) = clients.iter_mut().find(|client| client.is_none()) else {
+        return false;
+    };
+    *slot = Some(address);
+    true
+}
+
 #[embassy_executor::task]
 #[allow(
     clippy::large_stack_frames,
@@ -213,8 +230,8 @@ async fn write_all(uart: &mut Uart<'static, esp_hal::Async>, data: &[u8]) {
 )]
 async fn bridge_task(
     stack: Stack<'static>,
-    mut uarts: [Uart<'static, esp_hal::Async>; 3],
-    mut display: StructSetSSD1306,
+    mut uart: Uart<'static, esp_hal::Async>,
+    mut display: Option<StructSetSSD1306>,
 ) -> ! {
     let rx_buffer = UDP_RX_BUFFER.init([0; UDP_BUFFER_SIZE]);
     let tx_buffer = UDP_TX_BUFFER.init([0; UDP_BUFFER_SIZE]);
@@ -238,25 +255,55 @@ async fn bridge_task(
     info!("Listening for UDP datagrams on 0.0.0.0:{}", UDP_PORT);
 
     let udp_to_uart = UDP_TO_UART.init([0; TRANSFER_BUFFER_SIZE]);
+    let uart_to_udp = UART_TO_UDP.init([0; TRANSFER_BUFFER_SIZE]);
+    let mut udp_clients = [None; UDP_CLIENT_LIMIT];
+    let mut client_limit_warned = false;
 
     loop {
-        match socket.recv_from(&mut udp_to_uart[..]).await {
-            Ok((DISPLAY_FRAME_SIZE, _)) => {
-                let frame: &[u8; DISPLAY_FRAME_SIZE] = udp_to_uart[..DISPLAY_FRAME_SIZE]
-                    .try_into()
-                    .expect("slice length equals DISPLAY_FRAME_SIZE");
-                if let Err(error) = display.set_from_1024_bytes_array_top_left_to_down_right(frame)
+        match select(
+            socket.recv_from(&mut udp_to_uart[..]),
+            uart.read_async(&mut uart_to_udp[..]),
+        )
+        .await
+        {
+            Either::First(Ok((length, sender))) => {
+                if !remember_udp_client(&mut udp_clients, sender.endpoint.addr)
+                    && !client_limit_warned
                 {
-                    warn!("Display update failed: {:?}", error);
+                    warn!(
+                        "UDP client limit ({}) reached; additional client IPs will not receive UART replies",
+                        UDP_CLIENT_LIMIT
+                    );
+                    client_limit_warned = true;
+                }
+
+                if length == DISPLAY_FRAME_SIZE {
+                    let frame: &[u8; DISPLAY_FRAME_SIZE] = udp_to_uart[..DISPLAY_FRAME_SIZE]
+                        .try_into()
+                        .expect("slice length equals DISPLAY_FRAME_SIZE");
+                    if let Some(display) = display.as_mut()
+                        && let Err(error) =
+                            display.set_from_1024_bytes_array_top_left_to_down_right(frame)
+                    {
+                        warn!("Display update failed: {:?}", error);
+                    }
+                } else {
+                    write_all(&mut uart, &udp_to_uart[..length]).await;
                 }
             }
-            Ok((length, _)) => {
-                for uart in uarts.iter_mut() {
-                    write_all(uart, &udp_to_uart[..length]).await;
-                }
-            }
-            Err(error) => {
+            Either::First(Err(error)) => {
                 warn!("UDP receive failed: {:?}", error);
+            }
+            Either::Second(Ok(length)) => {
+                for address in udp_clients.iter().flatten() {
+                    let destination = IpEndpoint::new(*address, UART_TO_UDP_PORT);
+                    if let Err(error) = socket.send_to(&uart_to_udp[..length], destination).await {
+                        warn!("UART-to-UDP send failed: {:?}", error);
+                    }
+                }
+            }
+            Either::Second(Err(error)) => {
+                warn!("UART read failed: {:?}", error);
             }
         }
     }
@@ -270,7 +317,6 @@ async fn bridge_task(
 async fn main(spawner: Spawner) -> ! {
     esp_println::logger::init_logger_from_env();
 
-    
     let wifi_ssid_default = "UART.LOCAL";
     let wifi_password_default = "12345678";
 
@@ -295,13 +341,24 @@ async fn main(spawner: Spawner) -> ! {
     let i2c =
         esp_hal::i2c::master::I2c::new(peripherals.I2C0, esp_hal::i2c::master::Config::default())
             .unwrap()
-            .with_sda(peripherals.GPIO8)
-            .with_scl(peripherals.GPIO9);
-    let mut display = StructSetSSD1306::new(i2c).unwrap();
-    display.set_black().unwrap();
-    display
-        .set_text("Wi-Fi UART\nConnecting...", Point::new(0, 0))
-        .unwrap();
+            .with_sda(peripherals.GPIO7)
+            .with_scl(peripherals.GPIO8);
+    let mut display = match StructSetSSD1306::new(i2c) {
+        Ok(display) => Some(display),
+        Err(error) => {
+            warn!(
+                "SSD1306 not found at 0x3C/0x3D on SDA GPIO{} / SCL GPIO{}: {:?}; continuing without display",
+                ssd1306::SSD1306_SDA_PIN,
+                ssd1306::SSD1306_SCL_PIN,
+                error
+            );
+            None
+        }
+    };
+    if let Some(display) = display.as_mut() {
+        let _ = display.set_black();
+        let _ = display.set_text("Wi-Fi UART\nConnecting...", Point::new(0, 0));
+    }
     info!(
         "OLED I2C uses SDA GPIO{} and SCL GPIO{}",
         ssd1306::SSD1306_SDA_PIN,
@@ -342,47 +399,41 @@ async fn main(spawner: Spawner) -> ! {
     info!("Connected to Wi-Fi; waiting for a DHCP address");
     stack.wait_config_up().await;
     info!("Network ready: {:?}", stack.config_v4());
-    display.set_black().unwrap();
+    if let Some(display) = display.as_mut() {
+        let _ = display.set_black();
+    }
 
     let uart_config = UartConfig::default()
         .with_baudrate(UART_BAUDRATE)
         .with_parity(UART_PARITY)
         .with_stop_bits(UART_STOP_BITS)
         .with_data_bits(UART_DATA_BITS);
-    // Transmit only: RX pins (18, 6, 5) are left unused.
-    let uart0 = Uart::new(peripherals.UART0, uart_config)
-        .expect("UART0 configuration failed")
-        .with_tx(peripherals.GPIO4)
-        .into_async();
-    let uart1 = Uart::new(peripherals.UART1, uart_config)
+    let uart = Uart::new(peripherals.UART1, uart_config)
         .expect("UART1 configuration failed")
-        .with_tx(peripherals.GPIO7)
-        .into_async();
-    let uart2 = Uart::new(peripherals.UART2, uart_config)
-        .expect("UART2 configuration failed")
-        .with_tx(peripherals.GPIO17)
+        .with_rx(peripherals.GPIO6)
+        .with_tx(peripherals.GPIO5)
         .into_async();
 
     info!(
-        "UART TX outputs: GPIO{}, GPIO{}, GPIO{} at {} baud",
-        UART_TX_PINS[0], UART_TX_PINS[1], UART_TX_PINS[2], UART_BAUDRATE
+        "UART1 bidirectional: TX GPIO{}, RX GPIO{} at {} baud",
+        UART_TX_PIN, UART_RX_PIN, UART_BAUDRATE
     );
-    let uarts = [uart0, uart1, uart2];
     let ipv4 = stack.config_v4().unwrap().address;
 
-    display
-        .set_text(
+    if let Some(display) = display.as_mut() {
+        let _ = display.set_text(
             &alloc::format!(
-                "Wi-Fi connected\nUDP port: {}\nUART TX 17,7,4: {} baud\nIP: {}",
+                "Wi-Fi connected\nUDP in: {}\nUART 5/6: {} baud\nReply port: {}\nIP: {}",
                 UDP_PORT,
                 UART_BAUDRATE,
+                UART_TO_UDP_PORT,
                 ipv4
             ),
             Point::new(0, 0),
-        )
-        .unwrap();
+        );
+    }
 
-    spawner.spawn(bridge_task(stack, uarts, display).expect("Bridge task storage is exhausted"));
+    spawner.spawn(bridge_task(stack, uart, display).expect("Bridge task storage is exhausted"));
     spawner.spawn(mdns_task(stack).expect("mDNS task storage is exhausted"));
 
     loop {

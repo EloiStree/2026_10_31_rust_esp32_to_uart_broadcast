@@ -1,12 +1,12 @@
+import select
 import socket
 import struct
 import time
 
 
-
-
 UDP_IP = "192.168.137.50"
 UDP_PORT = 3615
+UDP_REPLY_PORT = 2501
 
 
 # Try to fetch IPv4 address of the "uart.local" mDNS hostname
@@ -19,6 +19,7 @@ except socket.gaierror:
 
 
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.bind(("", UDP_REPLY_PORT))
 
 values = [1175, 1174,1300,1301,1302,1303,1304,1305,2300,2301,2302,2303,2304,2305]
 
@@ -29,6 +30,11 @@ def send_value(value):
     data = f"{value}\n".encode("utf-8")
     sock.sendto(data, (UDP_IP, UDP_PORT))
     print(f"Sent {value} to {UDP_IP}:{UDP_PORT} -> {value}")
+    readable, _, _ = select.select([sock], [], [], 1)
+    while readable:
+        data, sender = sock.recvfrom(4096)
+        print(f"UART reply from {sender}: {data!r}")
+        readable, _, _ = select.select([sock], [], [], 0)
 
 if __name__ == "__main__":
     try:

@@ -45,17 +45,29 @@ https://docs.freenove.com/projects/fnk0101/en/latest/fnk0101/codes/tutorial/2_ES
 
 
 
-Hardware use in this tool:
+Hardware used with this tool:
+- Seeed Studio XIAO ESP32-S3
 - SSD1306
-- Level Shifter
-- ESP32S3 WROOM 1
+- Level shifter for UART connections to 5 V devices
 - Arduino Leonardo Keyestudio
 - Freenove Breakout Board
 
 
 Hardware that would be nice for this tool, if it works:
-- [Seeed Studio XIAO ESP32-S3](https://www.seeedstudio.com/XIAO-ESP32S3-p-5627.html) instead of the WROOM
 - [Pro Micro Controller 32U4](https://www.amazon.com.be/-/en/Controller-Update-Interface-Compatible-Arduino/dp/B0D9D5KW2Q/ref=asc_df_B0D9D5KW2Q) instead of Leonardo
+
+## XIAO ESP32-S3 wiring and data flow
+
+The firmware uses one full-duplex UART at 9600 baud, 8-N-1:
+
+- XIAO GPIO5 (D4, TX) -> other device RX
+- XIAO GPIO6 (D5, RX) <- other device TX
+- Connect the device grounds together.
+- SSD1306 I2C: SDA GPIO7 (D8), SCL GPIO8 (D9), address `0x3C` or `0x3D`.
+
+GPIOs on the XIAO are 3.3 V. Never connect a 5 V UART TX signal directly to GPIO6; use a suitable level shifter. Translate GPIO5's signal too if the receiving device requires 5 V logic.
+
+UDP clients send datagrams to the device on port `3615`; the firmware writes them to UART TX. A 1024-byte datagram is reserved for an SSD1306 frame and is displayed instead of being sent over UART. UART RX data is sent back to each remembered client IP on UDP port `2501`. A client must first send a datagram to port `3615`; up to 8 distinct IPs are remembered until reboot. Bind the client's UDP listener to port `2501` to receive UART data. UART data is forwarded as read chunks, not as line-delimited messages.
 
 
 Level Shifter to explore in the future:
@@ -99,4 +111,3 @@ Example:
 - https://github.com/eloistree/2026_02_11_makecode_hello_uart_in        
 - https://github.com/EloiStree/2026_09_12_makecode_hello_uart_bluetooth_ks_4036
 - https://github.com/EloiStree/2026_09_12_makecode_hello_uart_bluetooth_ks_4036/tree/pins_ble_input_version
-
