@@ -17,6 +17,12 @@ pub struct StructSetSSD1306 {
     pixels: alloc::boxed::Box<[u8]>,
     i2c: esp_hal::i2c::master::I2c<'static, esp_hal::Blocking>,
     address: u8,
+    // What the display RAM currently holds, used to send only the differences.
+    sent: alloc::boxed::Box<[u8]>,
+    // The display RAM content is unknown until the first full write.
+    force_full: bool,
+    // Control byte 0x40 (data) followed by the 1024 frame bytes.
+    tx: alloc::boxed::Box<[u8]>,
 }
 
 #[allow(
@@ -44,6 +50,13 @@ impl StructSetSSD1306 {
             pixels: alloc::vec![0; 1024].into_boxed_slice(),
             i2c,
             address,
+            sent: alloc::vec![0; 1024].into_boxed_slice(),
+            force_full: true,
+            tx: {
+                let mut tx = alloc::vec![0; 1025].into_boxed_slice();
+                tx[0] = 0x40;
+                tx
+            },
         };
         // Standard SSD1306 128x64 init sequence (control byte 0x00 = commands).
         let init: [u8; 25] = [
@@ -68,19 +81,56 @@ impl StructSetSSD1306 {
         }
     }
 
-    /// Pushes the stored pixel array to the display.
+    /// Pushes only what changed since the last refresh. Unchanged frames cost
+    /// nothing; otherwise one window + data write per dirty page covers the
+    /// changed column range, or the whole frame when that is cheaper.
     pub fn refresh(&mut self) -> Result<(), esp_hal::i2c::master::Error> {
-        for page in 0..8usize {
-            // Set page and column start.
-            self.i2c
-                .write(self.address, &[0x00, 0xB0 | page as u8, 0x00, 0x10])?;
-            let mut buf = [0u8; 129];
-            buf[0] = 0x40; // control byte: data
-            for x in 0..128usize {
-                buf[x + 1] = self.pixels[page * 128 + x];
+        // Approximate cost of an extra transaction, in bytes on the wire.
+        const SPAN_OVERHEAD: usize = 16;
+        let mut spans: [Option<(usize, usize)>; 8] = [None; 8];
+        let mut cost = 0;
+        for (page, span) in spans.iter_mut().enumerate() {
+            let range = page * 128..(page + 1) * 128;
+            let (new, old) = (&self.pixels[range.clone()], &self.sent[range]);
+            if let Some(first) = new.iter().zip(old).position(|(a, b)| a != b) {
+                let last = new
+                    .iter()
+                    .zip(old)
+                    .rposition(|(a, b)| a != b)
+                    .unwrap_or(first);
+                *span = Some((first, last));
+                cost += last - first + 1 + SPAN_OVERHEAD;
             }
-            self.i2c.write(self.address, &buf)?;
         }
+
+        if self.force_full || cost >= 1024 + SPAN_OVERHEAD {
+            self.i2c
+                .write(self.address, &[0x00, 0x21, 0, 127, 0x22, 0, 7])?;
+            self.tx[1..].copy_from_slice(&self.pixels);
+            self.i2c.write(self.address, &self.tx)?;
+        } else {
+            for (page, span) in spans.iter().enumerate() {
+                let Some((first, last)) = *span else { continue };
+                let len = last - first + 1;
+                self.i2c.write(
+                    self.address,
+                    &[
+                        0x00,
+                        0x21,
+                        first as u8,
+                        last as u8,
+                        0x22,
+                        page as u8,
+                        page as u8,
+                    ],
+                )?;
+                let start = page * 128 + first;
+                self.tx[1..=len].copy_from_slice(&self.pixels[start..start + len]);
+                self.i2c.write(self.address, &self.tx[..=len])?;
+            }
+        }
+        self.sent.copy_from_slice(&self.pixels);
+        self.force_full = false;
         Ok(())
     }
 
@@ -194,19 +244,8 @@ impl StructSetSSD1306 {
         &mut self,
         data: &[u8; 1024],
     ) -> Result<(), esp_hal::i2c::master::Error> {
-        for y in 0usize..64 {
-            for x in 0usize..128 {
-                let byte_index = (y / 8) * 128 + x;
-                let bit_index = y % 8;
-                let on = (data[byte_index] >> bit_index) & 1 != 0;
-                let color = if on {
-                    BinaryColor::On
-                } else {
-                    BinaryColor::Off
-                };
-                self.put(Point::new(x as i32, y as i32), color);
-            }
-        }
+        // The input already uses the SSD1306 page layout.
+        self.pixels.copy_from_slice(data);
         self.refresh()
     }
 }

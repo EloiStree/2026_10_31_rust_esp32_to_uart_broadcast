@@ -43,6 +43,8 @@ const UART_DATA_BITS: esp_hal::uart::DataBits = esp_hal::uart::DataBits::_8;
 
 const UART_TX_PIN: u8 = 5;
 const UART_RX_PIN: u8 = 6;
+// 400 kHz is the I2C fast-mode limit; many SSD1306 modules also work at 800-1000 kHz.
+const I2C_FREQUENCY_KHZ: u32 = 400;
 const UDP_PORT: u16 = 3615;
 const UART_TO_UDP_PORT: u16 = 2501;
 const UDP_CLIENT_LIMIT: usize = 8;
@@ -338,11 +340,14 @@ async fn main(spawner: Spawner) -> ! {
     esp_rtos::start(timg0.timer0, peripherals.FROM_CPU_INTR0);
     info!("Embassy initialized");
 
-    let i2c =
-        esp_hal::i2c::master::I2c::new(peripherals.I2C0, esp_hal::i2c::master::Config::default())
-            .unwrap()
-            .with_sda(peripherals.GPIO7)
-            .with_scl(peripherals.GPIO8);
+    let i2c = esp_hal::i2c::master::I2c::new(
+        peripherals.I2C0,
+        esp_hal::i2c::master::Config::default()
+            .with_frequency(esp_hal::time::Rate::from_khz(I2C_FREQUENCY_KHZ)),
+    )
+    .unwrap()
+    .with_sda(peripherals.GPIO7)
+    .with_scl(peripherals.GPIO8);
     let mut display = match StructSetSSD1306::new(i2c) {
         Ok(display) => Some(display),
         Err(error) => {
