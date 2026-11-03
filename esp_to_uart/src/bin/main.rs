@@ -40,7 +40,7 @@ const UART_PARITY: esp_hal::uart::Parity = esp_hal::uart::Parity::None;
 const UART_STOP_BITS: esp_hal::uart::StopBits = esp_hal::uart::StopBits::_1;
 const UART_DATA_BITS: esp_hal::uart::DataBits = esp_hal::uart::DataBits::_8;
 
-const UART_TX_PINS: [u8; 5] = [4, 5, 7, 8, 17];
+const UART_TX_PINS: [u8; 3] = [17, 7, 4];
 const UDP_PORT: u16 = 3615;
 const UDP_BUFFER_SIZE: usize = 4096;
 const UDP_PACKET_SLOTS: usize = 8;
@@ -213,7 +213,7 @@ async fn write_all(uart: &mut Uart<'static, esp_hal::Async>, data: &[u8]) {
 )]
 async fn bridge_task(
     stack: Stack<'static>,
-    mut uarts: [Uart<'static, esp_hal::Async>; 2],
+    mut uarts: [Uart<'static, esp_hal::Async>; 3],
     mut display: StructSetSSD1306,
 ) -> ! {
     let rx_buffer = UDP_RX_BUFFER.init([0; UDP_BUFFER_SIZE]);
@@ -349,7 +349,11 @@ async fn main(spawner: Spawner) -> ! {
         .with_parity(UART_PARITY)
         .with_stop_bits(UART_STOP_BITS)
         .with_data_bits(UART_DATA_BITS);
-    // Transmit only: RX pins (6, 18) are left unused.
+    // Transmit only: RX pins (18, 6, 5) are left unused.
+    let uart0 = Uart::new(peripherals.UART0, uart_config)
+        .expect("UART0 configuration failed")
+        .with_tx(peripherals.GPIO4)
+        .into_async();
     let uart1 = Uart::new(peripherals.UART1, uart_config)
         .expect("UART1 configuration failed")
         .with_tx(peripherals.GPIO7)
@@ -358,17 +362,18 @@ async fn main(spawner: Spawner) -> ! {
         .expect("UART2 configuration failed")
         .with_tx(peripherals.GPIO17)
         .into_async();
+
     info!(
-        "UART TX outputs: GPIO{}, GPIO{} at {} baud",
-        UART_TX_PINS[0], UART_TX_PINS[1], UART_BAUDRATE
+        "UART TX outputs: GPIO{}, GPIO{}, GPIO{} at {} baud",
+        UART_TX_PINS[0], UART_TX_PINS[1], UART_TX_PINS[2], UART_BAUDRATE
     );
-    let uarts = [uart1, uart2];
+    let uarts = [uart0, uart1, uart2];
     let ipv4 = stack.config_v4().unwrap().address;
 
     display
         .set_text(
             &alloc::format!(
-                "Wi-Fi connected\nUDP port: {}\nUART TX 7,17: {} baud\nIP: {}",
+                "Wi-Fi connected\nUDP port: {}\nUART TX 17,7,4: {} baud\nIP: {}",
                 UDP_PORT,
                 UART_BAUDRATE,
                 ipv4
